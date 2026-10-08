@@ -1,130 +1,208 @@
-# Architecture
+# CUBE Recovery Manager Architecture
 
-This document describes the **starter**. At the bottom is a section for **your Pod's architecture**, which you must fill in and which is part of the submission. A submission whose `ARCHITECTURE.md` still only describes the starter has not documented its system.
+This document describes the implemented Round 3 Recovery Manager, not the
+starter template.
 
-## 1. The system
-
-```text
-                POD
-                 │
-       ┌─────────▼─────────┐      owns workflow state; derives status and final outcome from the evidence chain
-       │    Orchestrator   │      routes · validates · records evidence · retries · handles failures and UNCERTAIN
-       └─────────┬─────────┘
-                 │  Agent Input ▼          ▲ Agent Output (evidence)
-       ┌─────────▼─────────┐
-       │     Receiving     │
-       └─────────┬─────────┘
-                 ↓
-       ┌───────────────────┐
-       │       Prep        │   (FBA units)
-       └─────────┬─────────┘
-                 ↓
-       ┌───────────────────┐
-       │       Pack        │   (merchant-fulfilled / 3PL units)
-       └─────────┬─────────┘
-                 ↓
-       ┌───────────────────┐
-       │      Returns      │   (if a return happened)
-       └─────────┬─────────┘
-                 ↓
-       ┌───────────────────┐
-       │     Recovery      │   reads ALL accumulated evidence
-       └─────────┬─────────┘
-                 ↓
-          Final Outcome        derived by the orchestrator, not copied from any agent
-
-  shared/schemas · shared/contracts · shared/utils      data/input · data/sample · data/expected      examples/
-```
-
-The arrows show the *expected commerce journey*. Physically, every hand-off goes through the orchestrator ([`INTEGRATION-GUIDE.md`](INTEGRATION-GUIDE.md) section 1).
-
-## 2. Responsibilities
-
-| Component | Responsible for | Not responsible for |
-|---|---|---|
-| **Agent** (`agents/<stage>/`) | One stage's judgment, returned as an Agent Output with an Evidence Record. Failing open. Refusing other tenants. | Calling other agents. Setting workflow state. Rewriting earlier evidence. |
-| **Orchestrator** (`orchestration/`) | Starting workflows; identifying the current stage; invoking agents with context; validating and recording evidence; updating state; routing; retries; failures; UNCERTAIN; the final outcome. | Making stage judgments. Fabricating or deleting evidence. Turning UNCERTAIN into PASS/FAIL without an explicit rule. |
-| **Contract** (`shared/schemas/`) | One strict set of data shapes. | Agent-specific logic (that goes in `payload`). |
-| **Stubs** (`agents/*/app.py` as shipped) | Replaying Round 2 CSV rows as valid evidence, so the plumbing can be tested. | Pretending to be agents. |
-
-## 3. Shared data
-
-| Object | Owner | Lives in |
-|---|---|---|
-| Evidence Record | the agent that produced it (immutable) | the evidence store |
-| Workflow State | **the orchestrator** | the workflow store |
-| Overrides | the orchestrator records them; a person makes them | Workflow State (`overrides[]`), referencing evidence |
-| Final Outcome | **the orchestrator**, derived | Workflow State (`final_outcome`) |
-| Captures | the Pod | `data/input/<subject>/<stage>/`, referenced by `sha256` |
-
-## 4. Evidence flow and workflow state
+## 1. Component diagram
 
 ```text
-Agent Result → Evidence Record → Orchestrator state transition → Next stage → New evidence → Updated workflow state → Final Outcome
+                Streamlit UI
+                     |
+                     v
+              Orchestrator
+                     |
+    +----------------+----------------+
+    |        |        |        |       |
+    v        v        v        v       v
+Receiving   Prep    Pack   Returns  Recovery
+    |        |        |        |       |
+    +--------+--------+--------+-------+
+                     |
+                     v
+              Evidence Store
+                     |
+                     v
+              Final Outcome
 ```
 
-- Each stage's evidence is stored and passed to **every later stage** as `previous_evidence`.
-- State is `PENDING → IN_PROGRESS → COMPLETED`, or `FAILED` / `BLOCKED` / `RECOVERY_REQUIRED` ([`ORCHESTRATION-GUIDE.md`](ORCHESTRATION-GUIDE.md) section 5), always derived from the evidence and overrides.
-- `transitions[]` is the audit trail.
-- A reviewer can walk from the Final Outcome to `contributing_records`, to checks, to `evidence_refs`, to the `sha256` of the exact bytes examined.
+The Streamlit UI and FastAPI API are two front doors to the same orchestrator.
+Neither front door calls an agent directly.
 
-## 5. Error handling
+```mermaid
+sequenceDiagram
+    participant UI as Streamlit/API
+    participant O as Orchestrator
+    participant A as Agent
+    participant S as FileStore
+    UI->>O: create/resume workflow
+    O->>O: create workflow ID and route stages
+    loop applicable stages
+        O->>A: handle(Agent Input)
+        A-->>O: Agent Output + Evidence Record
+        O->>O: validate schema, tenant, hash, stage
+        O->>S: persist workflow and immutable evidence
+    end
+    O->>O: derive status and final outcome
+    O-->>UI: workflow state
+```
 
-Every failure is **recorded and never becomes success**: a degraded evidence record stands in (no checks, UNCERTAIN, the error), the stage is `error`, the workflow `FAILED` with outcome `INCOMPLETE`. Transient failures retry; refusals and invalid output do not; UNCERTAIN is preserved; `resume` retries. Full table: [`ORCHESTRATION-GUIDE.md`](ORCHESTRATION-GUIDE.md) section 8. Tenancy: `org_id` on every request, record and workflow; a record about another org is rejected as a security event; **your storage must enforce it too**.
+## 2. Workflow creation and IDs
 
-## 6. Final outcome
+`POST /workflows` or the Streamlit Start Workflow action supplies
+`org_id`, `unit_id`/`subject_id`, route, return state, and optional case
+context. The orchestrator creates a stable ID:
 
-`CLEAN`, `CLAIM_RECOMMENDED`, `EXCEPTION`, `NEEDS_REVIEW` or `INCOMPLETE`, with the reason, the contributing evidence, `needs_human`, and `provisional` (true unless the workflow is `COMPLETED`). Default rules: [`ORCHESTRATION-GUIDE.md`](ORCHESTRATION-GUIDE.md) section 6.
+```text
+WF-<org_id>-<unit_id>
+```
 
-## 7. What is fixed and what is yours
+Repeated requests for the same workflow reuse persisted state rather than
+creating a second workflow.
 
-**Fixed (the contract, strict):**
+## 3. Agent sequencing and manifests
 
-- The five required agents and their stages (Specialist Pods: four agents plus integration work, see [`FAQ.md`](FAQ.md))
-- Common evidence requirements: the Agent Input/Output and Evidence Record shapes; PASS / FAIL / UNCERTAIN; the status vocabularies
-- Required traceability: workflow id, agent id, hashes, `upstream_refs`, overrides that reference what they supersede
-- An orchestrator that owns workflow state and produces a **Final Outcome**
-- Minimum testing, and the submission and evaluation requirements ([`SUBMISSION-GUIDE.md`](SUBMISSION-GUIDE.md), [`ROUND3-RUBRIC.md`](ROUND3-RUBRIC.md))
+The flow in `orchestration/flow.json` routes:
 
-**Participant-designed (the implementation, flexible):**
+```text
+Receiving -> Prep for FBA
+           -> Pack for MFN
+           -> Returns when returned=true
+           -> Recovery
+```
 
-- Internal architecture, programming language, frameworks, how each agent is built
-- How the orchestrator is implemented (the starter is one option; LangGraph, a queue, a state machine, your own)
-- The communication mechanism (in-process, HTTP, queue) as long as the contract holds
-- Database, persistence, deployment platform
-- UI, review queue, dashboards
-- Additional services, additional features
-- The final-outcome policy, routing and `on_uncertain` / `on_error` policies (documented in `docs/decisions.md`)
+Each stage is discovered from `agents/<stage>/agent.json`, which declares its
+stage, agent ID, mode, module, URL, and implementation notes. Each current
+Python agent exposes:
 
-## 8. Extension points
+```python
+handle(request: dict) -> dict
+```
 
-| You want to… | Change |
-|---|---|
-| Add or reroute a stage | `orchestration/flow.json` (and write a decision) |
-| Change the final decision or status rules | `orchestration/rollup.py` (and its tests, and a decision) |
-| Plug in a real agent | `agents/<stage>/app.py` + `agent.json` |
-| Run an agent as a service in any language | `agent.json` `mode: "http"` + [`agent-api.md`](shared/contracts/agent-api.md) |
-| Run your own subjects | `data/input/<subject>/<stage>/` + a cases file |
-| Add agent-specific data to evidence | `payload` (never the envelope) |
-| Persist to a database | implement the four store methods in `orchestration/store.py` |
+The orchestrator can use the in-process client or the HTTP client, depending
+on `ORCH_MODE` and the manifest.
 
-## 9. Deployment options (yours)
+## 4. Evidence propagation and validation
 
-- **Single process:** `uvicorn orchestration.api:app` with all agents `inproc`. Simplest.
-- **Orchestrator + agent services:** each agent its own process, `mode: "http"`, `<STAGE>_URL` set; `GET /health` for readiness.
-- Whatever you pick, the demo runs from the submitted commit and any URL works without your accounts. The API ships with **no authentication**: add it before exposing it.
+Every later stage receives:
 
----
+- Original workflow and subject identifiers
+- Stage-specific discovered inputs
+- All earlier evidence records
+- Current workflow overrides
+- Case context
 
-## Your Pod's architecture  ← **replace this section**
+Before accepting an output, the orchestrator validates the agent-output and
+evidence schemas, stage, workflow ID, organization/subject tenancy, output and
+evidence consistency, and content hash.
 
-_Delete this note and describe **your** system. At minimum:_
+Evidence records contain checks, verdicts, confidence, model metadata,
+timestamps, inputs, upstream references, and content hashes. `FileStore`
+persists evidence by record ID and rejects a different body for an existing
+record ID. This preserves the audit trail without pretending that a hash alone
+is tamper-proof.
 
-1. **Diagram** of your actual components and flow, including anything you added.
-2. **What each agent really is**: model, rules, services, dependencies; which are still stubs.
-3. **Your orchestrator**: approach, how workflow state is stored, retries, how evidence is persisted, how overrides work (link the decisions in `docs/decisions.md`).
-4. **Your routing and final-outcome logic**, and how they treat uncertainty and weak evidence.
-5. **Tenancy**: where it is enforced, and how you tested it.
-6. **Failure model**: what you break in the demo and what happens.
-7. **Deployment**: where it runs, how to reach it, how to start it.
-8. **Known limits.**
+## 5. Missing evidence and contradictions
+
+Missing visual or upstream evidence is represented as `pending`, `error`, or
+`UNCERTAIN`; it is never turned into `PASS`. Recovery treats unsupported
+charges as `SILENT` and records why they cannot be claimed.
+
+Contradictions are retained explicitly through charge positions, source record
+IDs, check details, and final-outcome reasoning. Human overrides are separate
+append-only entries and do not rewrite the original evidence record.
+
+## 6. Retry, timeout, failure, and resume behavior
+
+Transient `AgentTimeout` and `AgentUnavailable` failures are retried according
+to flow defaults. Connection failures are distinguished from response
+timeouts. Refusals, invalid output, tenant mismatches, and unexpected agent
+exceptions are recorded as non-success failures.
+
+Each stage records runs, latest attempts, timestamps, duration, error details,
+and evidence status. `POST /workflows/{id}/resume` clears the halt and retries
+failed or incomplete stages while retaining earlier evidence and failed
+attempt records.
+
+No exception path returns a success-shaped result.
+
+## 7. Human overrides
+
+`POST /workflows/{id}/overrides` records the actor, reason, original verdict,
+previous effective verdict, new verdict, and superseded record ID. The
+orchestrator recalculates the final outcome from the effective verdict while
+preserving the original agent result.
+
+## 8. Tenant and organization validation
+
+`org_id`, `subject_id`, and `workflow_id` are carried through every request,
+record, and persisted workflow. Agents scope sample/capture lookups to the
+organization and reject unknown subjects. The orchestrator rejects output
+about another organization or subject. The persistence layer uses workflow
+and evidence IDs, and must be placed behind tenant authorization in a
+multi-user deployment.
+
+The current FastAPI API has no authentication or authorization. It must not be
+publicly exposed until those controls are added.
+
+## 9. Durable FileStore
+
+The existing `orchestration.store.FileStore` writes:
+
+```text
+out/workflows/<workflow_id>.json
+out/evidence/<record_id>.json
+```
+
+Writes use temporary files and atomic replacement for workflow state. The
+Streamlit UI uses this store rather than relying only on session state, so
+reruns and process restarts retain workflow state, evidence, errors, and
+overrides.
+
+## 10. Final outcome derivation
+
+`orchestration.rollup` derives status and outcome from stored evidence and
+overrides. It distinguishes:
+
+- `CLEAN`
+- `CLAIM_RECOMMENDED`
+- `EXCEPTION`
+- `NEEDS_REVIEW`
+- `INCOMPLETE`
+
+Workflow statuses distinguish completed, failed, blocked, recovery-required,
+and in-progress conditions. Recovery informs the evidence chain; the
+orchestrator remains the authority that derives the consolidated final
+outcome.
+
+## 11. AI and fallback paths
+
+The existing agents retain their real implementations. Some have optional
+live model paths and labelled local fallback/replay paths:
+
+- Missing Prep visual evidence yields honest `UNCERTAIN`.
+- Pack may use CSV replay when no images are supplied.
+- Returns may use labelled CSV replay only when no photos are supplied.
+- Receiving and Recovery have deterministic local paths when no model key is
+  configured.
+
+Fallback data is synthetic or operator-provided test data, not real-world
+evidence. The live-only dependencies are listed in
+`requirements-live.txt`; the core requirements remain sufficient for the
+default application and tests.
+
+## 12. API and Streamlit separation
+
+The FastAPI application in `orchestration/api.py` exposes:
+
+```text
+GET  /health
+POST /workflows
+GET  /workflows/{id}
+GET  /workflows/{id}/evidence
+POST /workflows/{id}/resume
+POST /workflows/{id}/overrides
+```
+
+`app.py` is the sole Streamlit entry point. It renders workflow state and
+calls orchestrator functions for creation, resume, and overrides. It does not
+sequence agents, construct evidence, or derive outcomes itself.

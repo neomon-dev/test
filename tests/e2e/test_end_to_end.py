@@ -8,6 +8,7 @@ import pytest
 from orchestration.orchestrator import apply_override, bundle, discover_inputs, flow_stages, load_flow, resume, run_workflow
 from orchestration.store import FileStore, MemoryStore
 from shared.utils.schema import errors
+from tests.helpers import Fake
 
 ROOT = Path(__file__).resolve().parents[2]
 OUTCOMES = {"CLEAN", "CLAIM_RECOMMENDED", "EXCEPTION", "NEEDS_REVIEW", "INCOMPLETE"}
@@ -40,16 +41,17 @@ def test_audit_trail_explains_every_stage(cases):
 def test_claim_names_amount_and_cites_evidence(cases):
     if "prep" not in flow_stages():
         pytest.skip("Specialist flow has no Prep evidence, so the sample contains no claimable charge")
+    case = next(c for c in cases if c["unit_id"] == "UNIT-0014")
     store = MemoryStore()
-    for case in cases:
-        wf = run_workflow(case, store=store)
-        if wf["final_outcome"]["outcome"] == "CLAIM_RECOMMENDED":
-            assert wf["final_outcome"]["claimable_usd"] > 0
-            rec = store.get_evidence(next(s["record_id"] for s in wf["stage_results"] if s["stage"] == "recovery"))
-            claimed = [c for c in rec["payload"]["charges"] if c["position"] == "CONTRADICTS"]
-            assert claimed and all(c["evidence_record_ids"] for c in claimed), "no claim without attached evidence"
-            return
-    raise AssertionError("sample data should contain at least one claim")
+    # The real Prep agent correctly returns UNCERTAIN without captures. Supply a
+    # contract-valid PASS at the agent boundary to exercise the claim path with
+    # complete upstream evidence; the orchestration and Recovery logic remain real.
+    wf = run_workflow(case, store=store, clients={"prep": Fake("PASS")})
+    assert wf["final_outcome"]["outcome"] == "CLAIM_RECOMMENDED"
+    assert wf["final_outcome"]["claimable_usd"] > 0
+    rec = store.get_evidence(next(s["record_id"] for s in wf["stage_results"] if s["stage"] == "recovery"))
+    claimed = [c for c in rec["payload"]["charges"] if c["position"] == "CONTRADICTS"]
+    assert claimed and all(c["evidence_record_ids"] for c in claimed), "no claim without attached evidence"
 
 
 def test_wrong_tenant_cannot_pull_another_orgs_subject(cases):

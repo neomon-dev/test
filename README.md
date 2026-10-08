@@ -1,125 +1,268 @@
-# Cube Buildathon · Round 3 · Pod Integration Build
+# CUBE Build-A-Thon Round 3 Recovery Manager
 
-**Commerce Context stream · Round 3 · Pod build**
+CUBE Recovery Manager is a five-agent commerce workflow application. It
+follows one unit through receiving, preparation, packing, returns, and
+recovery, while preserving the evidence needed to explain every decision.
 
-> Five agents, one unit, one record that follows it. In Round 3 your Pod connects the five Round 2 agents into **one commerce system**.
+The application is an integration of the existing agents; it is not a
+replacement implementation. Agents do not call each other. The orchestrator
+owns sequencing, workflow state, evidence propagation, retries, failures,
+resume, overrides, and final-outcome derivation.
 
-**New here? Read [`START-HERE.md`](START-HERE.md) first.** This README is the concise overview; the detailed rules live in the guides.
-
-## Objective
-
-Integrate the five independently built Round 2 agents into one connected, end-to-end commerce workflow, and show it working. **Integrate → Orchestrate → Test → Deploy → Demonstrate.** Not a rebuild.
-
-## What the Pod builds
+## Architecture
 
 ```text
-Receiving → Prep → Pack → Returns → Recovery → Final Commerce Outcome
+                Streamlit UI
+                     |
+                     v
+              Orchestrator
+                     |
+    +----------------+----------------+
+    |        |        |        |       |
+    v        v        v        v       v
+Receiving   Prep    Pack   Returns  Recovery
+    |        |        |        |       |
+    +--------+--------+--------+-------+
+                     |
+                     v
+              Evidence Store
+                     |
+                     v
+              Final Outcome
 ```
 
-| Member | Agent | Folder |
+The normal route is:
+
+```text
+Receiving -> Prep (FBA) or Pack (MFN) -> Returns (when returned) -> Recovery
+```
+
+Every agent has an `agent.json` manifest and an in-process `handle(request)`
+entry point. The orchestrator can also call an agent over HTTP using the
+contract endpoints. The five agents are:
+
+- **Receiving** — receiving identity, quantity, carton, damage, and quality checks.
+- **Prep** — FBA preparation checks; AI observes when captures and credentials
+  are available, while deterministic rules produce the contract verdict.
+- **Pack** — merchant-fulfilled packing checks, with optional Gemini vision.
+- **Returns** — returns identity, completeness, condition, and disposition;
+  its live path uses a batched OpenAI-compatible vision call.
+- **Recovery** — evaluates charges against all upstream evidence and does not
+  claim unsupported charges.
+
+The Streamlit layer does **not** call agents directly. It calls the
+orchestrator's reusable Python functions. The API layer exposes the same
+orchestrator through FastAPI.
+
+## Current entry point
+
+Start the application with:
+
+```powershell
+python -m streamlit run app.py
+```
+
+The UI supports:
+
+- Creating or loading a workflow
+- Entering organization, case/unit, route, return, and JSON context data
+- Viewing progress for all five stages
+- Viewing attempts, timings, results, and failures
+- Filtering traceable evidence by source agent
+- Reviewing missing evidence and explicit contradictions
+- Viewing the Recovery decision and recommended action
+- Recording append-only human overrides
+- Inspecting workflow timestamps, errors, overrides, and transition history
+
+## API
+
+Start the API separately when an HTTP front door is required:
+
+```powershell
+python -m uvicorn orchestration.api:app --port 8100
+```
+
+Available endpoints:
+
+| Method | Endpoint | Purpose |
 |---|---|---|
-| 1 | Receiving Manager | `agents/receiving/` |
-| 2 | Prep Manager | `agents/prep/` |
-| 3 | Pack Manager | `agents/pack/` |
-| 4 | Returns Manager | `agents/returns/` |
-| 5 | Recovery Manager | `agents/recovery/` |
+| GET | `/health` | Orchestrator and agent availability |
+| POST | `/workflows` | Create and run a workflow |
+| GET | `/workflows/{id}` | Read workflow state |
+| GET | `/workflows/{id}/evidence` | Read workflow state plus evidence |
+| POST | `/workflows/{id}/resume` | Resume a failed or paused workflow |
+| POST | `/workflows/{id}/overrides` | Record an operator override |
 
-Each member owns one agent. The Pod jointly owns the orchestration, shared contracts, workflow state, integration, end-to-end testing, documentation, demo and submission. **No participant owns the final system alone.**
+Example:
 
-## Architecture in one picture
+```powershell
+Invoke-RestMethod http://127.0.0.1:8100/health
+```
+
+The API has no authentication. Do not expose it publicly until authentication
+and tenant authorization have been added.
+
+## Persistence and workflow behavior
+
+The existing JSON-backed `orchestration.store.FileStore` persists:
 
 ```text
-              ┌────────────────────────── Orchestrator (owns workflow state) ───────────────────────────┐
- case ──────▶ │ route · pass previous evidence · validate · record evidence · retry · UNCERTAIN · outcome │ ──▶ Workflow State
-              └────┬─────────┬─────────┬─────────┬─────────┬────────────────────────────────────────────┘      + Final Outcome
-        Agent Input ▼         │         │         │         │  ▲ Agent Output (result + Evidence Record)
-              Receiving     Prep      Pack     Returns   Recovery     ← each: in-process handle()  OR  HTTP /health + /run
+out/workflows/<workflow_id>.json
+out/evidence/<record_id>.json
 ```
 
-- **One contract.** Every agent takes an *Agent Input* and returns an *Agent Output* containing an *Evidence Record*: per-check verdicts (PASS / FAIL / **UNCERTAIN**), confidence, model/version, timestamps, hashes.
-- **One owner of state.** The orchestrator derives workflow status and the final outcome from the evidence chain. Agent outputs inform; they do not set state.
-- **Failures are recorded, never hidden,** and never become success.
+Workflow state survives Streamlit reruns and process restarts. Evidence is
+retained and written immutably by record ID. Overrides are retained as
+append-only workflow history. Failed or paused workflows can be resumed
+without deleting earlier evidence.
 
-Details: [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`INTEGRATION-GUIDE.md`](INTEGRATION-GUIDE.md) · [`ORCHESTRATION-GUIDE.md`](ORCHESTRATION-GUIDE.md).
+The orchestrator:
 
-## Quick setup and how to run
+1. Creates a workflow ID from the organization and unit.
+2. Loads the flow and agent manifests.
+3. Invokes each applicable `handle(request)` in order.
+4. Passes all earlier evidence and overrides to later stages.
+5. Validates schema, stage, workflow, tenant, consistency, and content hash.
+6. Stores valid evidence and records degraded evidence for failures.
+7. Retries transient timeout/unavailable failures.
+8. Supports resume from failed or halted stages.
+9. Applies human overrides without rewriting agent evidence.
+10. Derives the final outcome from the stored evidence chain.
 
-Requires Python 3.11+.
+## Evidence policy
 
-```sh
-make setup            # venv + dependencies + .env
-make test             # integration, end-to-end, failure, UNCERTAIN, override and HTTP tests
-make run              # all sample workflows end to end -> out/workflows/*.json and out/evidence/*.json
-make case UNIT=UNIT-0014 ORG=org_demo_alpha     # one workflow, in full
-make serve            # orchestrator API on :8100 (POST /workflows, GET /workflows/{id}, GET /health)
+Evidence includes workflow, organization, subject, stage, record ID, checks,
+verdicts, confidence, inputs, upstream references, timestamps, and a content
+hash. Conclusions are traceable to the records and inputs that support them.
+
+Missing evidence is represented as missing, pending, or uncertain. It is never
+converted into positive evidence. Contradictions are represented explicitly
+with their source records. Visual evidence that cannot be confirmed may
+produce `UNCERTAIN` or `PENDING`, and Recovery must not claim an unsupported
+charge.
+
+Failure semantics are explicit:
+
+- A timeout becomes a retryable recorded failure.
+- An unavailable agent becomes a retryable recorded failure.
+- A failed or invalid agent output becomes an error/pending evidence record.
+- Retries increase the stage attempt count.
+- Resume preserves previous evidence and retries the failed stage.
+- `UNCERTAIN` remains uncertain until an authorized human override is recorded.
+
+## AI and replay/fallback behavior
+
+The agents have real model-backed paths when the required captures and
+credentials are present. They also have deliberately labelled fallback paths
+for local operation and contract tests:
+
+- Receiving uses deterministic sample-data fallback without a Gemini key.
+- Prep returns honest `UNCERTAIN` evidence when visual observation is
+  unavailable.
+- Pack can replay its sample CSV when no images are supplied.
+- Returns uses a labelled CSV replay only when no photos are supplied; that
+  replay copies an operator disposition and is not an agent judgment.
+- Recovery uses deterministic evidence rules and may optionally call Gemini.
+
+Replay/fallback data is synthetic or operator-provided test data. It is not
+real-world evidence and is never silently represented as live model evidence.
+
+## Installation
+
+From a clean checkout:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
-Out of the box everything runs on **organiser stub agents** replaying the synthetic Round 2 CSVs. **Replacing a stub with your real agent is your job.**
+Optional live model dependencies:
 
-Run an agent as its own service:
-
-```sh
-.venv/bin/uvicorn agents.prep.app:app --port 8102
-curl localhost:8102/health          # then set "mode": "http" in agents/prep/agent.json
+```powershell
+pip install -r requirements-live.txt
 ```
 
-## Where participants put their agents
+The core requirements are sufficient to run the default application and test
+suite without model credentials. Copy `.env.example` to `.env` only when
+local configuration is needed; never commit `.env`.
 
-`agents/<stage>/` (`app.py` exposes `handle()`; `agent.json` describes your agent). Shared areas need Pod-level coordination: `orchestration/`, `shared/`, `tests/`, `docs/`. See [`PARTICIPANT-GUIDE.md`](PARTICIPANT-GUIDE.md).
+## Configuration
 
-## How the agents connect
+Configuration is read from environment variables. Relevant names include:
 
-Through the orchestrator only. It sends each agent an Agent Input (subject, this stage's captures, **all previous evidence**, overrides), validates and stores the Agent Output's evidence, updates workflow state, and decides what runs next. See [`INTEGRATION-GUIDE.md`](INTEGRATION-GUIDE.md).
+- `ORCH_MODE`, `ORCH_FLOW`
+- `OUT_DIR`, `DATA_DIR`, `INPUT_DIR`
+- `RECEIVING_URL`, `PREP_URL`, `PACK_URL`, `RETURNS_URL`, `RECOVERY_URL`
+- `GEMINI_API_KEY`, `GOOGLE_API_KEY`
+- `VLM_API_KEY`, `VLM_BASE_URL`, `VLM_MODEL`
+- `VLM_TIMEOUT_SECONDS`, `VLM_MAX_RETRIES`
+- `LOG_LEVEL`, `LOG_FORMAT`
 
-## Required environment variables
+See [.env.example](.env.example) for placeholder names only.
 
-Copy `.env.example` to `.env`. **Never commit `.env`.**
+## Testing
 
-| Variable | Purpose | Default |
-|---|---|---|
-| `ORCH_MODE` | Force `inproc` or `http` for all agents | each `agent.json` |
-| `ORCH_FLOW` | Flow file for the API | the flow in `pod.json` |
-| `<STAGE>_URL` | Where an `http`-mode agent listens (`PREP_URL`, …) | `agent.json` `url` |
-| `OUT_DIR` | Where workflow state and evidence are written | `out` |
-| `DATA_DIR`, `INPUT_DIR` | Sample CSVs for the stubs; your per-stage captures | `data/sample`, `data/input` |
-| `LOG_LEVEL`, `LOG_FORMAT` | Logging | `WARNING`, `json` |
-| Model provider keys | Whatever *your* agents use (e.g. `ANTHROPIC_API_KEY`) | none |
+Run:
 
-## Example end-to-end workflow
+```powershell
+python -m pytest -q
+```
 
-`UNIT-0014` (FBA, returned). Full files in [`examples/end-to-end/`](examples/end-to-end/).
+Current expected result:
 
 ```text
-Receiving  RCV-0014  accept          PASS   ─┐
-Prep       PRP-0014  compliant       PASS    │  every record is stored and handed forward as previous_evidence
-Pack       skipped (route = fba: Amazon packs it)
-Returns    RTN-0014  liquidate       PASS   ─┤
-Recovery   RCY-UNIT-0014  claim_recommended  FAIL ◀─┘
-             • inbound_defect_fee  $2.00  CONTRADICTS  <- cites PRP-0014 (Prep says compliant)
-             • weight-tier fee     $4.75  SILENT       <- no measured weight upstream; NOT claimed
-Workflow status COMPLETED · Final outcome CLAIM_RECOMMENDED ($2.00, evidence attached)
+92 passed, 1 skipped, 0 failed
 ```
 
-(The stubs' claim rules are illustrative; your Recovery agent decides for real.) Also see [`examples/happy-path/`](examples/happy-path/), [`examples/uncertain-path/`](examples/uncertain-path/), [`examples/failure-path/`](examples/failure-path/).
+The one skipped test is the historical organiser-stub golden-output check.
+It is skipped because the manifests now describe the integrated real agent
+implementations rather than the original all-stub configuration.
 
-## Repository structure
+Additional checks:
+
+```powershell
+python -m compileall .
+python -m streamlit run app.py
+```
+
+## Security
+
+Organization IDs are carried through workflow requests, evidence, storage, and
+agent validation. Agents reject unknown or cross-tenant subjects, and the
+orchestrator rejects evidence for the wrong organization or subject.
+
+The API is currently unauthenticated. Add authentication, authorization, and
+tenant-aware access controls before any public deployment. Never put API keys,
+tokens, passwords, or private keys in source, `.env.example`, logs, evidence,
+or Git history.
+
+## Repository layout
 
 ```text
-START-HERE.md  README.md  PARTICIPANT-GUIDE.md  GITHUB-GUIDE.md  RULES.md  FAQ.md
-ARCHITECTURE.md  INTEGRATION-GUIDE.md  EVIDENCE-CONTRACT.md  ORCHESTRATION-GUIDE.md
-ROUND3-RUBRIC.md  SUBMISSION-GUIDE.md  DEMO-GUIDE.md  pod.json  .env.example
-agents/{receiving,prep,pack,returns,recovery}/   app.py · agent.json · README.md
-orchestration/       flow.json · orchestrator.py · rollup.py · store.py · clients.py · run.py (CLI) · api.py
-shared/schemas/      agent-input · agent-output · evidence · workflow-state · final-outcome · error
-shared/contracts/    agent-api.md        shared/utils/   hashing · schema validation · record builders · logging · server
-data/input/ (yours) · data/sample/ (Round 2 synthetic CSVs) · data/expected/ (golden outcomes for the stubs)
-examples/{happy-path,uncertain-path,failure-path,end-to-end}/      tests/{integration,e2e}/      docs/{build-log,decisions}.md
+app.py                    Streamlit UI
+agents/                   Five existing agent implementations
+orchestration/            Flow, clients, API, persistence, and rollup
+shared/                   Schemas, contracts, hashing, and utilities
+tests/                    Contract, integration, and end-to-end tests
+data/sample/              Synthetic sample data
+data/input/               Local capture inputs
+examples/                 Valid and historical/replay-oriented examples
+requirements.txt          Core runtime and test dependencies
+requirements-live.txt     Optional live model dependencies
 ```
 
-## Submission overview
+### Example data classification
 
-Your Pod's final repository (tagged), a working integrated system, documentation and architecture, a demo, a deployment URL if applicable, evaluation and testing evidence, and the LinkedIn post URL. The literal checklist, the process and the finality rules are in [`SUBMISSION-GUIDE.md`](SUBMISSION-GUIDE.md). Dates and the submission form are **TBA**.
+- `examples/uncertain-path` — **valid**: demonstrates missing visual evidence
+  and an honest uncertain outcome.
+- `examples/failure-path` — **valid**: demonstrates timeout/unavailable-agent
+  failure semantics.
+- `examples/happy-path` — **historical/test fixture**: generated for the
+  original organiser-stub contract and not a claim that current visual
+  evidence is complete.
+- `examples/end-to-end` — **historical/test fixture**: retained for regression
+  coverage and replay context; it must not be interpreted as live evidence.
 
----
-
-*CUBE Buildathon · Commerce Context · Round 3*
+The application does not load these historical examples as real production
+evidence.

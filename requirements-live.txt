@@ -1,0 +1,8 @@
+# Optional dependencies for live model-backed agent paths.
+# The default in-process/replay application and test suite only require
+# requirements.txt.
+google-genai>=1.0
+openai>=1.0
+pydantic-settings>=2.0
+tenacity>=8.0
+python-dotenv>=1.0

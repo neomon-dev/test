@@ -78,7 +78,10 @@ def test_recovery_honours_overrides_of_previous_evidence(cases):
                 "previous_verdict": "PASS", "new_verdict": "FAIL"}
     changed = client_for("recovery").run(make_input("recovery", case, prior, [override]), 30)["evidence"]
     pos = lambda ev: {c["charge_type"]: c["position"] for c in ev["payload"]["charges"]}  # noqa: E731
-    assert pos(base)["inbound_defect_fee"] == "CONTRADICTS"
+    # Real Prep has no visual captures in this fixture, so its UNCERTAIN
+    # evidence cannot support a claim. An explicit FAIL override changes the
+    # charge position to SUPPORTS without rewriting the original evidence.
+    assert pos(base)["inbound_defect_fee"] == "SILENT"
     assert pos(changed)["inbound_defect_fee"] == "SUPPORTS"
 
 

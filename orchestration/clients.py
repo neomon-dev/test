@@ -31,7 +31,8 @@ class InProcClient:
     def __init__(self, manifest: dict):
         self.handle = importlib.import_module(manifest["module"]).handle
 
-    def run(self, request: dict, timeout_s: float) -> dict:  # timeout is not enforced in-process
+    def run(self, request: dict, timeout_s: float) -> dict:
+        # Timeout is not enforced for in-process agents.
         try:
             return self.handle(request)
         except LookupError as exc:
@@ -45,22 +46,55 @@ class HttpClient:
 
     def run(self, request: dict, timeout_s: float) -> dict:
         try:
-            resp = httpx.post(f"{self.url}/run", json=request, timeout=timeout_s)
-        except httpx.TimeoutException as exc:
-            raise AgentTimeout(f"{type(exc).__name__}: {exc}") from exc
-        except httpx.HTTPError as exc:
-            raise AgentUnavailable(f"{type(exc).__name__}: {exc}") from exc
-        if 400 <= resp.status_code < 500:
-            raise AgentRejected(f"HTTP {resp.status_code}: {resp.text[:300]}")
-        if resp.status_code >= 500:
-            raise AgentUnavailable(f"HTTP {resp.status_code}: {resp.text[:300]}")
-        return resp.json()
+            resp = httpx.post(
+                f"{self.url}/run",
+                json=request,
+                timeout=timeout_s,
+            )
 
+        except httpx.ConnectTimeout as exc:
+            raise AgentUnavailable(f"{type(exc).__name__}: {exc}") from exc
+        except httpx.ReadTimeout as exc:
+            raise AgentTimeout(f"{type(exc).__name__}: {exc}") from exc
+        except httpx.WriteTimeout as exc:
+            raise AgentTimeout(f"{type(exc).__name__}: {exc}") from exc
+        except httpx.PoolTimeout as exc:
+            raise AgentTimeout(f"{type(exc).__name__}: {exc}") from exc
+
+        except httpx.NetworkError as exc:
+            raise AgentUnavailable(
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        except httpx.HTTPError as exc:
+            raise AgentUnavailable(
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        if 400 <= resp.status_code < 500:
+            raise AgentRejected(
+                f"HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+
+        if resp.status_code >= 500:
+            raise AgentUnavailable(
+                f"HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+
+        return resp.json()
     def health(self) -> dict:
-        return httpx.get(f"{self.url}/health", timeout=5).json()
+        return httpx.get(
+            f"{self.url}/health",
+            timeout=5,
+        ).json()
 
 
 def client_for(stage: str):
     manifest = load_manifest(stage)
     mode = os.environ.get("ORCH_MODE") or manifest["mode"]
-    return InProcClient(manifest) if mode == "inproc" else HttpClient(manifest)
+
+    return (
+        InProcClient(manifest)
+        if mode == "inproc"
+        else HttpClient(manifest)
+    )
