@@ -28,16 +28,15 @@ def test_example_validates(path):
 def test_example_cases_still_produce_the_documented_outcome(folder):
     """Re-run examples against the configured agents and current evidence policy.
 
-    The checked-in happy/end-to-end examples were generated for organiser CSV
-    stubs. The configured Prep agent is real and has no visual captures for
-    these cases, so UNCERTAIN/NEEDS_REVIEW is the documented current result.
+    Keep assertions tied to the checked-in documented workflow-state snapshots
+    instead of duplicating specific status/outcome constants here.
     """
     case = json.loads((EXAMPLES / folder / "case.json").read_text())
     flow = load_flow(EXAMPLES.parent / "orchestration/flow.json")
     wf = run_workflow(case, flow, MemoryStore())
     if folder == "uncertain-path":
         documented = json.loads((EXAMPLES / folder / "workflow-state.continue.json").read_text())
-        expected = (documented["status"], documented["final_outcome"]["outcome"])
     else:
-        expected = ("BLOCKED", "NEEDS_REVIEW")
+        documented = json.loads((EXAMPLES / folder / "workflow-state.json").read_text())
+    expected = (documented["status"], documented["final_outcome"]["outcome"])
     assert (wf["status"], wf["final_outcome"]["outcome"]) == expected
